@@ -1,0 +1,34 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Run Streamlit App (.venv, no debug)",
+      "type": "python",
+      "request": "launch",
+      "noDebug": true,
+      "python": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
+      "module": "streamlit",
+      "args": [
+        "run",
+        "src/main.py"
+      ],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": true
+    },
+    {
+      "name": "Debug Streamlit App (.venv)",
+      "type": "python",
+      "request": "launch",
+      "python": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
+      "module": "streamlit",
+      "args": [
+        "run",
+        "src/main.py"
+      ],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": false
+    }
+  ]
+}

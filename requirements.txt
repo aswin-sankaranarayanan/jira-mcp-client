@@ -1,0 +1,5 @@
+mcp[cli]>=1.2.0
+langchain>=0.3.0
+langchain-ollama>=0.2.0
+langgraph>=0.2.0
+streamlit>=1.35.0

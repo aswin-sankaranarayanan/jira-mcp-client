@@ -92,6 +92,29 @@ class OllamaService:
         )
         return response
 
+    def stream_generate(self, prompt: str) -> Iterable[str]:
+        """Send a fully-formed prompt to the LLM and stream response chunks."""
+        started_at = perf_counter()
+        chunk_count = 0
+        try:
+            for chunk in self._llm.stream(prompt):
+                content = getattr(chunk, "content", "")
+                if content:
+                    chunk_count += 1
+                    yield str(content)
+        except Exception:
+            logger.exception("LLM streaming failed")
+            raise
+        finally:
+            logger.info(
+                "Completed LLM response stream",
+                extra={
+                    "duration_ms": round((perf_counter() - started_at) * 1000, 2),
+                    "prompt_length": len(prompt),
+                    "chunk_count": chunk_count,
+                },
+            )
+
     def stream_markdown(self, text: str) -> Iterable[str]:
         logger.info("Streaming markdown response", extra={"input_length": len(text)})
         prompt = (

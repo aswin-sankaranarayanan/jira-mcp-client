@@ -5,6 +5,7 @@ from typing import Any, Dict, Optional, TypedDict
 
 class JiraGraphState(TypedDict, total=False):
     user_input: str
+    stream: bool
     intent: str
     issue_key: str
     board_name: str
@@ -21,3 +22,11 @@ class WorkflowResult(TypedDict):
     response: str
     metadata: Dict[str, Any]
     error: Optional[str]
+
+
+class WorkflowEvent(TypedDict, total=False):
+    type: str
+    request_id: str
+    stage: str
+    message: str
+    data: Dict[str, Any]

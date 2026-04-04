@@ -77,29 +77,43 @@ def run_app() -> None:
 
         with chat_panel:
             with st.chat_message("assistant", avatar="🧭"):
-                with st.spinner("Gathering Jira insights..."):
-                    result = st.session_state.engine.run(prompt)
+                assistant_text = ""
+                error_message = None
+                try:
+                    progress_placeholder = st.empty()
+                    response_placeholder = st.empty()
+                    progress_placeholder.info("Thinking...")
 
-                error_message = result.get("error")
-                assistant_text = str(result.get("response", "")).strip()
-
-                if error_message:
-                    st.error(str(error_message))
-                    if assistant_text:
-                        st.markdown(assistant_text)
-                else:
-                    try:
-                        streamed = st.write_stream(st.session_state.engine.stream_text(assistant_text))
-                        assistant_text = str(streamed).strip() if streamed is not None else assistant_text
-                    except Exception:
-                        logger.exception("Assistant streaming failed")
-                        stream_error = "I couldn't render the response in the chat UI right now. Please try again."
-                        st.error(stream_error)
-                        if assistant_text:
-                            st.markdown(assistant_text)
+                    for event in st.session_state.engine.stream_events(prompt):
+                        event_type = str(event.get("type") or "")
+                        message = str(event.get("message") or "")
+                        if event_type == "progress":
+                            progress_placeholder.info(message or "Working...")
+                            continue
+                        if event_type == "token":
+                            progress_placeholder.empty()
+                            assistant_text += message
+                            response_placeholder.markdown(assistant_text)
+                            continue
+                        if event_type == "final":
+                            progress_placeholder.empty()
+                            assistant_text = message
+                            response_placeholder.markdown(assistant_text)
+                            continue
+                        if event_type == "error":
+                            progress_placeholder.empty()
+                            error_message = message or "I couldn't render the response right now."
+                            st.error(error_message)
+                            break
+                        if event_type == "done":
+                            progress_placeholder.empty()
+                except Exception:
+                    logger.exception("Assistant streaming failed")
+                    error_message = "I couldn't render the response in the chat UI right now. Please try again."
+                    st.error(error_message)
 
         if not assistant_text and error_message:
-            assistant_text = str(error_message)
+            assistant_text = error_message
 
         logger.info("Completed chat response", extra={"response_length": len(assistant_text)})
 

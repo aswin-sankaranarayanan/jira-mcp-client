@@ -37,6 +37,9 @@ class FakeOllamaService:
     def infer_board_name(self, user_input: str):
         return "Platform Team"
 
+    def generate(self, prompt: str) -> str:
+        return prompt
+
 
 class SprintInsightsWorkflowTests(unittest.TestCase):
     def test_sprint_insights_uses_prompt_output_without_analysis_fallback(self) -> None:
@@ -50,7 +53,7 @@ class SprintInsightsWorkflowTests(unittest.TestCase):
         )
 
         self.assertEqual(result.get("final_response"), "Formatted sprint insights")
-        self.assertEqual(client.last_tool_args, {"board_name": "Platform Team"})
+        self.assertEqual(client.last_tool_args, {"scrum_board_name": "Platform Team"})
         self.assertIn("sprint_data_json", client.last_prompt_args)
         sprint_payload = json.loads(client.last_prompt_args["sprint_data_json"])
         self.assertEqual(sprint_payload.get("metadata"), {"board_name": "Platform Team"})
@@ -97,6 +100,21 @@ class SprintInsightsWorkflowTests(unittest.TestCase):
 
         self.assertIsNone(result.get("error"))
         self.assertEqual(result.get("final_response"), "")
+
+    def test_sprint_insights_returns_prompt_for_streaming_mode(self) -> None:
+        client = FakeMCPClient()
+        llm = FakeOllamaService()
+
+        result = run_sprint_insights_workflow(
+            {"user_input": "Show sprint progress for board Platform Team"},
+            client,
+            llm,
+            stream=True,
+        )
+
+        self.assertIsNone(result.get("error"))
+        self.assertEqual(result.get("final_response"), "")
+        self.assertEqual(result.get("prompt_output"), "Formatted sprint insights")
 
 
 if __name__ == "__main__":

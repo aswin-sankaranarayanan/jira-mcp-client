@@ -24,7 +24,12 @@ ISSUE_DETAILS_PROMPT_ERROR = (
 )
 
 
-def run_issue_details_workflow(state: JiraGraphState, mcp_client: MCPClient, llm_service: OllamaService) -> Dict[str, object]:
+def run_issue_details_workflow(
+    state: JiraGraphState,
+    mcp_client: MCPClient,
+    llm_service: OllamaService,
+    stream: bool = False,
+) -> Dict[str, object]:
     issue_key = state.get("issue_key") or extract_issue_key(state.get("user_input", ""))
     with logging_context(workflow="issue_details", issue_key=issue_key or None):
         if not issue_key:
@@ -70,7 +75,7 @@ def run_issue_details_workflow(state: JiraGraphState, mcp_client: MCPClient, llm
                 logger.warning("Issue details prompt template returned empty text")
 
             logger.info("Formatting issue details response via LLM")
-            final_text = llm_service.generate(prompt_text) if prompt_text else ""
+            final_text = "" if stream else (llm_service.generate(prompt_text) if prompt_text else "")
             if not final_text:
                 logger.warning("Issue details LLM response was empty")
             logger.info(
@@ -99,6 +104,7 @@ def run_issue_details_workflow(state: JiraGraphState, mcp_client: MCPClient, llm
         return {
             "issue_key": issue_key,
             "tool_output": tool_output,
+            "prompt_output": prompt_text,
             "final_response": final_text,
             "metadata": {
                 "workflow": "issue_details",

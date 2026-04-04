@@ -32,12 +32,18 @@ class FakeMCPClient:
         }
 
 
+class FakeOllamaService:
+    def generate(self, prompt: str) -> str:
+        return prompt
+
+
 class IssueDetailsWorkflowTests(unittest.TestCase):
     def test_issue_details_workflow_uses_declared_mcp_arguments(self) -> None:
         client = FakeMCPClient()
+        llm = FakeOllamaService()
         state = {"user_input": "Get the details of the issue PROJ-15"}
 
-        result = run_issue_details_workflow(state, client)
+        result = run_issue_details_workflow(state, client, llm)
 
         self.assertEqual(result.get("issue_key"), "PROJ-15")
         self.assertEqual(result.get("final_response"), "Formatted issue details")
@@ -46,9 +52,10 @@ class IssueDetailsWorkflowTests(unittest.TestCase):
 
     def test_issue_details_workflow_returns_friendly_error_when_prompt_fails(self) -> None:
         client = FakeMCPClient()
+        llm = FakeOllamaService()
         client.fail_prompt = True
 
-        result = run_issue_details_workflow({"user_input": "Get details for PROJ-15"}, client)
+        result = run_issue_details_workflow({"user_input": "Get details for PROJ-15"}, client, llm)
 
         self.assertEqual(
             result.get("error"),
@@ -58,12 +65,28 @@ class IssueDetailsWorkflowTests(unittest.TestCase):
 
     def test_issue_details_workflow_returns_friendly_error_when_prompt_text_is_empty(self) -> None:
         client = FakeMCPClient()
+        llm = FakeOllamaService()
         client.prompt_text = "   "
 
-        result = run_issue_details_workflow({"user_input": "Get details for PROJ-15"}, client)
+        result = run_issue_details_workflow({"user_input": "Get details for PROJ-15"}, client, llm)
 
         self.assertIsNone(result.get("error"))
         self.assertEqual(result.get("final_response"), "")
+
+    def test_issue_details_workflow_returns_prompt_for_streaming_mode(self) -> None:
+        client = FakeMCPClient()
+        llm = FakeOllamaService()
+
+        result = run_issue_details_workflow(
+            {"user_input": "Get details for PROJ-15"},
+            client,
+            llm,
+            stream=True,
+        )
+
+        self.assertIsNone(result.get("error"))
+        self.assertEqual(result.get("final_response"), "")
+        self.assertEqual(result.get("prompt_output"), "Formatted issue details")
 
 
 if __name__ == "__main__":

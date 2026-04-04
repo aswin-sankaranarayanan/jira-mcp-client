@@ -72,6 +72,7 @@ def run_sprint_insights_workflow(
     state: JiraGraphState,
     mcp_client: MCPClient,
     llm_service: OllamaService,
+    stream: bool = False,
 ) -> Dict[str, object]:
     board_name = state.get("board_name") or extract_board_name(state.get("user_input", ""))
     with logging_context(workflow="sprint_insights", board_name=board_name or None):
@@ -160,7 +161,7 @@ def run_sprint_insights_workflow(
                     logger.warning("Sprint insights prompt template returned empty text")
 
                 logger.info("Generating sprint insights report via LLM")
-                formatted = llm_service.generate(prompt_text) if prompt_text else ""
+                formatted = "" if stream else (llm_service.generate(prompt_text) if prompt_text else "")
                 if not formatted:
                     logger.warning("Sprint insights LLM response was empty")
                 logger.info(
@@ -189,6 +190,7 @@ def run_sprint_insights_workflow(
             return {
                 "board_name": board_name,
                 "tool_output": tool_output,
+                "prompt_output": prompt_text,
                 "final_response": formatted,
                 "metadata": {
                     "workflow": "sprint_insights",

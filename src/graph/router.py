@@ -14,6 +14,7 @@ from src.graph.parsing import extract_board_name, extract_issue_key
 from src.graph.state import JiraGraphState, WorkflowEvent, WorkflowResult
 from src.graph.workflows.issue_details import run_issue_details_workflow
 from src.graph.workflows.sprint_insights import run_sprint_insights_workflow
+from src.graph.workflows.team_status import run_team_status_workflow
 from src.llm.ollama import OllamaService
 from src.logging_config import get_logger, logging_context
 
@@ -33,6 +34,7 @@ class JiraWorkflowEngine:
         builder.add_node("detect_intent", self._detect_intent)
         builder.add_node("issue_details", self._issue_details)
         builder.add_node("sprint_insights", self._sprint_insights)
+        builder.add_node("team_status", self._team_status)
         builder.add_node("clarify", self._clarify)
 
         builder.set_entry_point("detect_intent")
@@ -42,12 +44,14 @@ class JiraWorkflowEngine:
             {
                 "issue_details": "issue_details",
                 "sprint_insights": "sprint_insights",
+                "team_status": "team_status",
                 "clarify": "clarify",
             },
         )
 
         builder.add_edge("issue_details", END)
         builder.add_edge("sprint_insights", END)
+        builder.add_edge("team_status", END)
         builder.add_edge("clarify", END)
         logger.debug("Compiled workflow graph")
         return builder.compile()
@@ -253,10 +257,10 @@ class JiraWorkflowEngine:
         metadata = state.get("metadata")
         if isinstance(metadata, dict):
             workflow = metadata.get("workflow")
-            if workflow in {"issue_details", "sprint_insights", "clarify"}:
+            if workflow in {"issue_details", "sprint_insights", "team_status", "clarify"}:
                 return str(workflow)
         intent = state.get("intent")
-        if intent in {"issue_details", "sprint_insights", "clarify"}:
+        if intent in {"issue_details", "sprint_insights", "team_status", "clarify"}:
             return str(intent)
         return "detect_intent"
 
@@ -265,6 +269,8 @@ class JiraWorkflowEngine:
             return "Fetching issue details..."
         if stage == "sprint_insights":
             return "Analyzing active sprint data..."
+        if stage == "team_status":
+            return "Collecting team member status updates..."
         if stage == "clarify":
             return "Preparing clarification..."
         return "Understanding your request..."
@@ -299,17 +305,27 @@ class JiraWorkflowEngine:
             stream=bool(state.get("stream")),
         )
 
+    def _team_status(self, state: JiraGraphState) -> Dict[str, object]:
+        return run_team_status_workflow(
+            state,
+            self._mcp_client,
+            self._llm_service,
+            stream=bool(state.get("stream")),
+        )
+
     def _clarify(self, state: JiraGraphState) -> Dict[str, object]:
         logger.info("Returning clarification response", extra={"workflow": "clarify"})
         return {
             "requires_clarification": True,
             "final_response": (
-                "I can help with two Jira workflows:\n"
+                "I can help with three Jira workflows:\n"
                 "1) Sprint insights for a specific board\n"
-                "2) Issue details for a specific issue key\n\n"
+                "2) Issue details for a specific issue key\n"
+                "3) Team member status report for a specific board\n\n"
                 "Try prompts like:\n"
                 "- Show sprint progress for board Platform Team\n"
-                "- Get details for issue PROJ-123"
+                "- Get details for issue PROJ-123\n"
+                "- Show team status for board Platform Team"
             ),
             "metadata": {"workflow": "clarify"},
         }

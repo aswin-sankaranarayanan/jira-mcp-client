@@ -22,14 +22,19 @@ class OllamaService:
     def detect_intent(self, user_input: str) -> str:
         started_at = perf_counter()
         prompt = (
-            "Classify this Jira request into one label: issue_details, sprint_insights, or clarify. "
+            "Classify this Jira request into one label: "
+            "issue_details, sprint_insights, team_status, or clarify. "
+            "Use 'team_status' for requests about team member statuses, standup reports, "
+            "or per-assignee issue summaries. "
             "Return JSON only with schema {\\\"intent\\\": \\\"<label>\\\"}.\n"
             f"Request: {user_input}"
         )
         raw = self._llm.invoke(prompt).content
         intent = self._safe_json_extract(raw).get("intent", "clarify")
         resolved_intent = (
-            intent if intent in {"issue_details", "sprint_insights", "clarify"} else "clarify"
+            intent
+            if intent in {"issue_details", "sprint_insights", "team_status", "clarify"}
+            else "clarify"
         )
         logger.info(
             "Detected workflow intent",
@@ -134,6 +139,20 @@ class OllamaService:
             raise
         finally:
             logger.info("Completed markdown stream", extra={"chunk_count": chunk_count})
+
+    def build_team_status_prompt(self, team_status_payload: dict) -> str:
+        """Build a prompt asking the LLM to generate a per-member status report for the scrum master."""
+        board_name = team_status_payload.get("board_name", "the board")
+        members = team_status_payload.get("team_members", [])
+        return (
+            f"You are a Jira assistant preparing a standup/status report for the scrum master "
+            f"of the '{board_name}' board.\n"
+            "For each team member listed below, summarize their current issue statuses "
+            "(open, in-progress, completed, blocked) and highlight any blockers or risks.\n"
+            "After the individual summaries, provide an overall team status section with "
+            "actionable insights and recommended next steps for the scrum master.\n\n"
+            f"Team status data:\n{json.dumps({'board_name': board_name, 'team_members': members}, indent=2)}"
+        )
 
     def _safe_json_extract(self, raw: object) -> dict:
         text = str(raw).strip()

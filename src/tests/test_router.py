@@ -56,7 +56,7 @@ class RouterTests(unittest.TestCase):
         chunks = list(engine.stream_response("hello"))
 
         self.assertTrue(chunks)
-        self.assertIn("I can help with two Jira workflows", "".join(chunks))
+        self.assertIn("I can help with three Jira workflows", "".join(chunks))
 
     def test_stream_response_streams_from_prompt_when_workflow_is_issue_details(self) -> None:
         class IssueIntentLLM(FakeOllamaService):

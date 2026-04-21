@@ -19,6 +19,22 @@ logger = get_logger(__name__)
 
 
 def _init_state() -> None:
+    """Bootstrap Streamlit session state for the current browser session.
+
+    Initialises three session-state keys if they are not already present:
+
+    * ``"session_id"`` — a 12-character hex identifier that persists for the
+      lifetime of the browser tab and is attached to all log records via
+      :func:`~src.logging_config.logging_context`.
+    * ``"messages"`` — an ordered list of ``{"role": str, "content": str}``
+      dicts representing the chat history, pre-seeded with the assistant's
+      welcome message.
+    * ``"engine"`` — the :class:`~src.graph.router.JiraWorkflowEngine`
+      instance shared across all interactions within the session.
+
+    This function is idempotent: calling it multiple times within the same
+    Streamlit session is safe and has no side effects beyond the first call.
+    """
     if "session_id" not in st.session_state:
         st.session_state.session_id = uuid4().hex[:12]
 
@@ -40,8 +56,22 @@ def _init_state() -> None:
         st.session_state.engine = JiraWorkflowEngine(client, llm)
         logger.info("Created workflow engine for session")
 
+    # Holds the active team-status collection session; None when not collecting.
+    if "team_status_session" not in st.session_state:
+        st.session_state.team_status_session = None
+
 
 def _render_messages(messages: List[Dict[str, str]]) -> None:
+    """Render a list of chat messages into the active Streamlit chat container.
+
+    Iterates over *messages* and uses :func:`streamlit.chat_message` to
+    render each entry with the appropriate avatar emoji (🧑 for user messages,
+    🧭 for assistant messages).  Message content is rendered as Markdown.
+
+    Args:
+        messages: Ordered list of message dicts, each containing ``"role"``
+            (``"user"`` or ``"assistant"``) and ``"content"`` keys.
+    """
     for message in messages:
         avatar = "🧑" if message["role"] == "user" else "🧭"
         with st.chat_message(message["role"], avatar=avatar):
@@ -49,6 +79,29 @@ def _render_messages(messages: List[Dict[str, str]]) -> None:
 
 
 def run_app() -> None:
+    """Configure and launch the Streamlit Jira Copilot chat interface.
+
+    Entry point called by :func:`src.main.main`.  Performs the following
+    steps on every Streamlit re-run:
+
+    1. Configures structured logging for the Streamlit process.
+    2. Sets the page title, icon, and layout via
+       :func:`streamlit.set_page_config`.
+    3. Injects global CSS from :data:`~src.ui.styles.APP_CSS`.
+    4. Initialises per-session state via :func:`_init_state`.
+    5. Renders the sticky header panel and the scrollable chat history.
+    6. Waits for user input via :func:`streamlit.chat_input`.
+    7. On new input: appends the user message, invokes
+       :meth:`~src.graph.router.JiraWorkflowEngine.stream_events`, and
+       streams the assistant response into the chat panel token-by-token.
+    8. Handles all event types (``"progress"``, ``"token"``, ``"final"``,
+       ``"error"``, ``"done"``) and falls back gracefully on exceptions.
+
+    Note:
+        ``st.set_page_config`` must be the first Streamlit call in the
+        script; this function satisfies that constraint by calling it before
+        any other ``st.*`` API.
+    """
     configure_logging(LOG_LEVEL, LOG_FORMAT)
     st.set_page_config(page_title=APP_TITLE, page_icon="🧭", layout="wide")
     st.markdown(APP_CSS, unsafe_allow_html=True)
@@ -84,7 +137,18 @@ def run_app() -> None:
                     response_placeholder = st.empty()
                     progress_placeholder.info("Thinking...")
 
-                    for event in st.session_state.engine.stream_events(prompt):
+                    # Route to the team-status collection handler when a
+                    # collection cycle is already in progress; otherwise use
+                    # the normal workflow engine.
+                    engine = st.session_state.engine
+                    if st.session_state.team_status_session is not None:
+                        event_source = engine.advance_team_status_collection(
+                            st.session_state.team_status_session, prompt
+                        )
+                    else:
+                        event_source = engine.stream_events(prompt)
+
+                    for event in event_source:
                         event_type = str(event.get("type") or "")
                         message = str(event.get("message") or "")
                         if event_type == "progress":
@@ -99,6 +163,16 @@ def run_app() -> None:
                             progress_placeholder.empty()
                             assistant_text = message
                             response_placeholder.markdown(assistant_text)
+                            continue
+                        if event_type == "session":
+                            # Update the team-status collection session in
+                            # Streamlit state without affecting the UI display.
+                            data = event.get("data") or {}
+                            action = str(data.get("action") or "")
+                            if action in {"team_status_start", "team_status_advance"}:
+                                st.session_state.team_status_session = data.get("session")
+                            elif action == "team_status_complete":
+                                st.session_state.team_status_session = None
                             continue
                         if event_type == "error":
                             progress_placeholder.empty()

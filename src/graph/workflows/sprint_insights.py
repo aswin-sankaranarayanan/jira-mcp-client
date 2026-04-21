@@ -27,6 +27,16 @@ SPRINT_INSIGHTS_PROMPT_ERROR = (
 
 
 def _as_non_empty_string(value: object, default: str) -> str:
+    """Return *value* as a stripped string, or *default* if blank or ``None``.
+
+    Args:
+        value: Any object; converted to ``str`` before stripping.
+        default: Fallback string returned when *value* is ``None`` or
+            produces an empty string after stripping.
+
+    Returns:
+        Stripped string value, or *default*.
+    """
     if value is None:
         return default
     text = str(value).strip()
@@ -34,6 +44,27 @@ def _as_non_empty_string(value: object, default: str) -> str:
 
 
 def _as_iso_date(value: object, fallback: date) -> str:
+    """Convert *value* to an ISO-8601 date string (``YYYY-MM-DD``).
+
+    Handles the following input types:
+
+    * :class:`datetime.datetime` — converted via ``.date().isoformat()``.
+    * :class:`datetime.date` — converted via ``.isoformat()``.
+    * ``str`` — stripped and parsed as ISO-8601; a trailing ``"Z"`` is
+      replaced with ``"+00:00"`` for compatibility with
+      :func:`datetime.fromisoformat`.
+
+    Returns *fallback* formatted as ISO-8601 for any unrecognised type or
+    parse failure.
+
+    Args:
+        value: Date value in one of the supported formats described above.
+        fallback: :class:`datetime.date` to use when *value* cannot be
+            parsed.
+
+    Returns:
+        An ISO-8601 date string in ``YYYY-MM-DD`` format.
+    """
     if isinstance(value, datetime):
         return value.date().isoformat()
     if isinstance(value, date):
@@ -53,6 +84,25 @@ def _as_iso_date(value: object, fallback: date) -> str:
 
 
 def _normalize_sprint_meta(raw_meta: object, board_name: str) -> Dict[str, object]:
+    """Normalise a raw sprint metadata object into a consistent schema.
+
+    Handles field aliasing (e.g. ``sprint_id`` → ``id``,
+    ``startDate`` → ``start_date``) and fills missing fields with safe
+    defaults: ``"unknown-sprint"`` for missing IDs, ``"Active Sprint"`` for
+    missing names, today's date as the start date, and today + 14 days as
+    the end date.
+
+    Args:
+        raw_meta: Raw sprint metadata dict from the MCP tool response, or
+            any non-dict value (treated as an empty dict).
+        board_name: Board name used as a fallback when ``board_name`` is
+            absent from *raw_meta*.
+
+    Returns:
+        A normalised dict with the following guaranteed keys:
+        ``id``, ``name``, ``start_date``, ``end_date``, ``goal``,
+        ``board_id``, ``board_name``.
+    """
     meta = raw_meta if isinstance(raw_meta, dict) else {}
     today = date.today()
     default_end = today + timedelta(days=14)
@@ -74,6 +124,36 @@ def run_sprint_insights_workflow(
     llm_service: OllamaService,
     stream: bool = False,
 ) -> Dict[str, object]:
+    """Execute the sprint-insights workflow and return a partial state update.
+
+    Orchestrates the full sprint-insights pipeline:
+
+    1. Resolves the target board name from the graph state, falling back to
+       LLM inference when regex extraction yields nothing.
+    2. Calls the ``get_active_sprint_issues`` MCP tool.
+    3. Normalises the tool response into a consistent sprint payload.
+    4. Calls the ``format_sprint_progress`` MCP prompt with the normalised
+       payload.
+    5. Passes the formatted prompt text to the LLM for final generation
+       (unless *stream* is ``True``, in which case generation is deferred
+       to the streaming layer).
+
+    Args:
+        state: Current LangGraph workflow state; must contain
+            ``"board_name"`` or a parseable ``"user_input"``.
+        mcp_client: Configured MCP client used to call tools and prompts.
+        llm_service: Configured Ollama service used for board name inference
+            and final response generation.
+        stream: When ``True``, skips eager LLM generation so that the
+            streaming layer can generate the response incrementally.
+
+    Returns:
+        A partial state dict suitable for merging into
+        :class:`~src.graph.state.JiraGraphState`.  On success, contains:
+        ``"board_name"``, ``"tool_output"``, ``"prompt_output"``,
+        ``"final_response"``, and ``"metadata"``.  On failure, contains
+        ``"error"`` and, where applicable, ``"requires_clarification"``.
+    """
     board_name = state.get("board_name") or extract_board_name(state.get("user_input", ""))
     with logging_context(workflow="sprint_insights", board_name=board_name or None):
         if not board_name:

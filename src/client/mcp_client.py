@@ -20,18 +20,60 @@ logger = get_logger(__name__)
 
 
 class MCPClientError(RuntimeError):
-    """Raised when an MCP operation fails."""
+    """Raised when an MCP operation fails.
+
+    Wraps lower-level transport, protocol, or server errors so that callers
+    can catch a single exception type without coupling to the underlying MCP
+    SDK exceptions.
+    """
 
 
 class MCPClient:
-    """Thin abstraction over MCP SSE transport and session lifecycle."""
+    """Thin abstraction over MCP SSE transport and session lifecycle.
+
+    Provides a simple async API for listing tools and prompts, invoking MCP
+    tools, and running MCP prompts against a remote MCP server over
+    Server-Sent Events (SSE).
+
+    Each public method opens a *fresh* SSE session for the duration of the
+    call and closes it afterwards, which keeps connection management simple
+    at the cost of per-call overhead.
+
+    Args:
+        server_url: Base URL of the MCP SSE endpoint
+            (e.g. ``"http://localhost:8000/sse"``).
+
+    Raises:
+        MCPClientError: Re-raised for any transport-level failure during
+            session initialisation or method invocation.
+    """
 
     def __init__(self, server_url: str) -> None:
+        """Initialise the client with the MCP server endpoint.
+
+        Args:
+            server_url: Full URL of the SSE endpoint exposed by the MCP
+                server (e.g. ``"http://localhost:8000/sse"``).
+        """
         self.server_url = server_url
         logger.info("Configured MCP client", extra={"server_url": server_url})
 
     @asynccontextmanager
     async def _session(self):
+        """Open an authenticated MCP session as an async context manager.
+
+        Establishes the SSE transport, creates a :class:`mcp.ClientSession`,
+        calls ``initialize()`` to complete the MCP handshake, and yields the
+        ready session.  The connection is always closed when the context exits.
+
+        Yields:
+            An initialised :class:`mcp.ClientSession` ready for tool and
+            prompt calls.
+
+        Raises:
+            MCPClientError: If the SSE connection or session initialisation
+                fails.
+        """
         logger.debug("Opening MCP session", extra={"server_url": self.server_url})
         try:
             async with sse_client(self.server_url) as streams:
@@ -45,6 +87,19 @@ class MCPClient:
             raise MCPClientError(f"Failed to connect to MCP server at {self.server_url}: {exc}") from exc
 
     async def list_tools(self) -> List[str]:
+        """Return the names of all tools registered on the MCP server.
+
+        Opens a temporary session, calls ``list_tools`` on the MCP protocol,
+        and extracts tool names from the response.
+
+        Returns:
+            A list of tool name strings, possibly empty if the server
+            registers no tools.
+
+        Raises:
+            MCPClientError: If the session cannot be established or the
+                server returns an error.
+        """
         async with self._session() as session:
             result = await session.list_tools()
             tools = [tool.name for tool in getattr(result, "tools", [])]
@@ -52,6 +107,19 @@ class MCPClient:
             return tools
 
     async def list_prompts(self) -> List[str]:
+        """Return the names of all prompts registered on the MCP server.
+
+        Opens a temporary session, calls ``list_prompts`` on the MCP
+        protocol, and extracts prompt names from the response.
+
+        Returns:
+            A list of prompt name strings, possibly empty if the server
+            registers no prompts.
+
+        Raises:
+            MCPClientError: If the session cannot be established or the
+                server returns an error.
+        """
         async with self._session() as session:
             result = await session.list_prompts()
             prompts = [prompt.name for prompt in getattr(result, "prompts", [])]
@@ -59,6 +127,28 @@ class MCPClient:
             return prompts
 
     async def call_tool(self, tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """Invoke a named MCP tool and return a structured result envelope.
+
+        Opens a fresh session, calls the tool, extracts both plain-text and
+        structured content from the response, and measures call latency.
+
+        Args:
+            tool_name: The registered name of the tool to invoke.
+            arguments: Key/value arguments forwarded to the tool as-is.
+
+        Returns:
+            A dictionary with the following keys:
+
+            * ``"name"`` — echoed *tool_name*.
+            * ``"arguments"`` — echoed *arguments*.
+            * ``"text"`` — concatenated plain-text content from the response.
+            * ``"structured"`` — parsed structured content, or ``None``.
+            * ``"raw"`` — string representation of the raw MCP response.
+
+        Raises:
+            MCPClientError: If the session fails to open or the tool call
+                returns an error.
+        """
         started_at = perf_counter()
         logger.info("Calling MCP tool", extra={"tool_name": tool_name, "argument_keys": sorted(arguments)})
         async with self._session() as session:
@@ -94,6 +184,29 @@ class MCPClient:
                 raise MCPClientError(f"Tool call failed for '{tool_name}': {exc}") from exc
 
     async def run_prompt(self, prompt_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """Execute a named MCP prompt and return the resulting text.
+
+        Opens a fresh session, calls ``get_prompt``, strips any leading JSON
+        blob from the assistant reply (which some MCP servers prepend), and
+        measures call latency.
+
+        Args:
+            prompt_name: The registered name of the prompt to execute.
+            arguments: Key/value arguments forwarded to the prompt as-is.
+
+        Returns:
+            A dictionary with the following keys:
+
+            * ``"name"`` — echoed *prompt_name*.
+            * ``"arguments"`` — echoed *arguments*.
+            * ``"text"`` — the human-readable portion of the assistant reply,
+              with any leading JSON blob stripped.
+            * ``"raw"`` — string representation of the raw MCP response.
+
+        Raises:
+            MCPClientError: If the session fails to open or the prompt
+                execution returns an error.
+        """
         started_at = perf_counter()
         logger.info(
             "Running MCP prompt",
@@ -140,6 +253,23 @@ class MCPClient:
             return text
 
     def _extract_text(self, payload: Any, structured_fallback: Any = None) -> str:
+        """Extract all plain-text content from an MCP response payload.
+
+        Handles both tool responses (which expose ``.content`` with text
+        blocks) and prompt responses (which expose ``.messages`` with nested
+        content).  For prompt responses, assistant/model messages are
+        preferred; messages from other roles act as a fallback.
+
+        Args:
+            payload: A raw MCP SDK response object — either a tool result or
+                a prompt result.
+            structured_fallback: Unused; reserved for future structured-to-
+                text conversion.
+
+        Returns:
+            A single string formed by joining all extracted text chunks with
+            newlines.  Returns an empty string if no text content is found.
+        """
         chunks: List[str] = []
 
         # Tool outputs often expose .content
@@ -170,6 +300,23 @@ class MCPClient:
         return "\n".join(chunk for chunk in chunks if chunk).strip()
 
     def _extract_message_text(self, message: Any) -> str:
+        """Extract the plain-text body from a single MCP message object.
+
+        Handles three content shapes:
+
+        * A bare ``str`` — returned directly after stripping.
+        * A ``list`` of content blocks — each block's ``.text`` attribute is
+          joined with newlines.
+        * An object with a ``.text`` attribute — the attribute value is
+          returned as a stripped string.
+
+        Args:
+            message: An MCP message object with a ``content`` attribute.
+
+        Returns:
+            Stripped plain text, or an empty string if no text can be
+            extracted.
+        """
         content = getattr(message, "content", None)
 
         if isinstance(content, str):
@@ -187,6 +334,19 @@ class MCPClient:
         return str(text).strip() if text else ""
 
     def _extract_structured_content(self, payload: Any) -> Any:
+        """Extract structured (non-text) content from an MCP tool response.
+
+        First checks for the ``structuredContent`` attribute introduced in
+        newer MCP tool response schemas.  Falls back to inspecting content
+        blocks for ``data`` or ``json`` attributes.
+
+        Args:
+            payload: A raw MCP tool result object.
+
+        Returns:
+            The structured payload (a dict, list, or primitive), or ``None``
+            if no structured content is present.
+        """
         # Newer MCP tool responses can provide structuredContent directly.
         structured = getattr(payload, "structuredContent", None)
         if structured is not None:

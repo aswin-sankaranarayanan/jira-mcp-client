@@ -30,6 +30,35 @@ def run_issue_details_workflow(
     llm_service: OllamaService,
     stream: bool = False,
 ) -> Dict[str, object]:
+    """Execute the issue-details workflow and return a partial state update.
+
+    Orchestrates the full issue-details pipeline:
+
+    1. Resolves the target issue key from the graph state, falling back to
+       regex extraction from ``"user_input"``.
+    2. Calls the ``get_issue_details`` MCP tool with the issue key.
+    3. Calls the ``format_issue_details`` MCP prompt with the raw JSON
+       response from the tool.
+    4. Passes the formatted prompt text to the LLM for final generation
+       (unless *stream* is ``True``, in which case generation is deferred
+       to the streaming layer).
+
+    Args:
+        state: Current LangGraph workflow state; must contain
+            ``"issue_key"`` or a parseable ``"user_input"``.
+        mcp_client: Configured MCP client used to call tools and prompts.
+        llm_service: Configured Ollama service used for final response
+            generation.
+        stream: When ``True``, skips eager LLM generation so that the
+            streaming layer can generate the response incrementally.
+
+    Returns:
+        A partial state dict suitable for merging into
+        :class:`~src.graph.state.JiraGraphState`.  On success, contains:
+        ``"issue_key"``, ``"tool_output"``, ``"prompt_output"``,
+        ``"final_response"``, and ``"metadata"``.  On failure, contains
+        ``"error"`` and, where applicable, ``"requires_clarification"``.
+    """
     issue_key = state.get("issue_key") or extract_issue_key(state.get("user_input", ""))
     with logging_context(workflow="issue_details", issue_key=issue_key or None):
         if not issue_key:

@@ -1,6 +1,6 @@
 """Shared LangGraph state definitions."""
 
-from typing import Any, Dict, Optional, TypedDict
+from typing import Any, Dict, List, Optional, TypedDict
 
 
 class JiraGraphState(TypedDict, total=False):
@@ -34,6 +34,16 @@ class JiraGraphState(TypedDict, total=False):
         metadata: Arbitrary key/value pairs attached by workflow nodes for
             observability (e.g. ``{"workflow": "issue_details", "tool":
             "get_issue_details"}``).
+        team_status_phase: Active phase of the team status collection cycle.
+            ``"collecting"`` while iterating over assignees; ``"complete"``
+            after the final report is generated.
+        assignees: Ordered list of assignee names discovered during team
+            status initiation (e.g. ``["Alice", "Bob"]``).
+        assignee_issues: Sprint issues grouped by assignee name.
+        current_assignee_index: Zero-based index of the assignee currently
+            being collected in the interactive loop.
+        collected_updates: Self-reported status text keyed by assignee name,
+            populated as each assignee provides their update.
     """
     user_input: str
     stream: bool
@@ -47,6 +57,11 @@ class JiraGraphState(TypedDict, total=False):
     error: str
     requires_clarification: bool
     metadata: Dict[str, Any]
+    team_status_phase: str
+    assignees: List[str]
+    assignee_issues: Dict[str, Any]
+    current_assignee_index: int
+    collected_updates: Dict[str, str]
 
 
 class WorkflowResult(TypedDict):

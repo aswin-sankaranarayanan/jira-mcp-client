@@ -14,7 +14,7 @@ from src.graph.parsing import extract_board_name, extract_issue_key
 from src.graph.state import JiraGraphState, WorkflowEvent, WorkflowResult
 from src.graph.workflows.issue_details import run_issue_details_workflow
 from src.graph.workflows.sprint_insights import run_sprint_insights_workflow
-from src.graph.workflows.team_status import run_team_status_workflow
+from src.graph.workflows.team_status import run_team_status_workflow, format_assignee_presentation
 from src.llm.ollama import OllamaService
 from src.logging_config import get_logger, logging_context
 
@@ -304,6 +304,26 @@ class JiraWorkflowEngine:
             stage=self._resolve_stage(result),
             message=content,
         )
+
+        # When the team-status workflow initiates a collection cycle, emit a
+        # structured "session" event so the UI can store the session state and
+        # route subsequent user inputs through advance_team_status_collection.
+        if result.get("team_status_phase") == "collecting":
+            session_data: Dict[str, object] = {
+                "board_name": str(result.get("board_name") or ""),
+                "assignees": list(result.get("assignees") or []),
+                "issues_by_assignee": dict(result.get("assignee_issues") or {}),
+                "current_index": int(result.get("current_assignee_index") or 0),
+                "collected_updates": dict(result.get("collected_updates") or {}),
+            }
+            yield self._event(
+                request_id,
+                "session",
+                stage="team_status",
+                message="",
+                data={"action": "team_status_start", "session": session_data},
+            )
+
         yield self._event(request_id, "done", stage=self._resolve_stage(result), message="done")
 
     def _iter_graph_snapshots(self, state: JiraGraphState) -> Iterable[Dict[str, object]]:
@@ -520,6 +540,132 @@ class JiraWorkflowEngine:
             self._llm_service,
             stream=bool(state.get("stream")),
         )
+
+    def advance_team_status_collection(
+        self,
+        session: Dict[str, Any],
+        status_update: str,
+    ) -> Iterable[WorkflowEvent]:
+        """Process one status update in the interactive team status collection cycle.
+
+        Records *status_update* for the current assignee, then either presents
+        the next assignee's issues or generates and streams the final scrum
+        master report when all assignees have been covered.
+
+        Args:
+            session: Active collection session dict maintained by the UI layer.
+                Must contain ``"board_name"``, ``"assignees"``,
+                ``"issues_by_assignee"``, ``"current_index"``, and
+                ``"collected_updates"`` keys.
+            status_update: The status text provided by the current assignee.
+
+        Yields:
+            :class:`~src.graph.state.WorkflowEvent` dicts.  When another
+            assignee remains: a ``"final"`` event with the next presentation
+            followed by a ``"session"`` event carrying the updated session.
+            When all assignees are done: ``"progress"``, token/``"final"``
+            events for the LLM report, a ``"session"`` event with
+            ``action="team_status_complete"`` and ``session=None``, then
+            ``"done"``.
+        """
+        request_id = uuid4().hex[:12]
+        assignees: list = session["assignees"]
+        current_index: int = session["current_index"]
+        current_assignee: str = assignees[current_index]
+        collected_updates: Dict[str, Any] = session["collected_updates"]
+
+        # Record the update for the current assignee.
+        collected_updates[current_assignee] = status_update
+        logger.info(
+            "Recorded team status update",
+            extra={"assignee": current_assignee, "index": current_index},
+        )
+
+        next_index = current_index + 1
+
+        if next_index < len(assignees):
+            # More assignees remain — present the next one.
+            next_assignee: str = assignees[next_index]
+            issues_by_assignee: Dict[str, Any] = session["issues_by_assignee"]
+            presentation = format_assignee_presentation(
+                next_assignee,
+                issues_by_assignee[next_assignee],
+                next_index,
+                len(assignees),
+            )
+            updated_session = {**session, "current_index": next_index}
+            yield self._event(request_id, "final", stage="team_status", message=presentation)
+            yield self._event(
+                request_id,
+                "session",
+                stage="team_status",
+                message="",
+                data={"action": "team_status_advance", "session": updated_session},
+            )
+            yield self._event(request_id, "done", stage="team_status", message="done")
+            return
+
+        # All assignees covered — generate the final scrum master report.
+        yield self._event(
+            request_id,
+            "progress",
+            stage="team_status",
+            message="All updates collected. Generating scrum master report...",
+        )
+
+        board_name: str = session["board_name"]
+        issues_by_assignee = session["issues_by_assignee"]
+        payload = {
+            "board_name": board_name,
+            "team_members": [
+                {
+                    "assignee": a,
+                    "issues": issues_by_assignee.get(a, []),
+                    "status_update": collected_updates.get(a, "(no update provided)"),
+                }
+                for a in assignees
+            ],
+        }
+        prompt = self._llm_service.build_scrum_master_report_prompt(payload)
+
+        chunk_count = 0
+        try:
+            for chunk in self._llm_service.stream_generate(prompt):
+                chunk_count += 1
+                yield self._event(request_id, "token", stage="team_status", message=chunk)
+        except Exception:
+            logger.exception("Scrum master report streaming failed; falling back to unary")
+            fallback = self._llm_service.generate(prompt)
+            if fallback:
+                yield self._event(request_id, "final", stage="team_status", message=fallback)
+            yield self._event(
+                request_id,
+                "session",
+                stage="team_status",
+                message="",
+                data={"action": "team_status_complete", "session": None},
+            )
+            yield self._event(request_id, "done", stage="team_status", message="done")
+            return
+
+        if chunk_count == 0:
+            logger.warning("LLM stream returned no chunks for scrum report; using unary fallback")
+            fallback = self._llm_service.generate(prompt)
+            if fallback:
+                yield self._event(request_id, "final", stage="team_status", message=fallback)
+
+        logger.info(
+            "Completed scrum master report stream",
+            extra={"assignee_count": len(assignees), "chunk_count": chunk_count},
+        )
+        yield self._event(
+            request_id,
+            "session",
+            stage="team_status",
+            message="",
+            data={"action": "team_status_complete", "session": None},
+        )
+        yield self._event(request_id, "done", stage="team_status", message="done")
 
     def _clarify(self, state: JiraGraphState) -> Dict[str, object]:
         """LangGraph node: return a clarification prompt to the user.

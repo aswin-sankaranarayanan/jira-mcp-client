@@ -7,6 +7,8 @@ from src.client.mcp_client import MCPClientError
 from src.graph.workflows.team_status import (
     _extract_assignee_name,
     _group_issues_by_assignee,
+    format_assignee_presentation,
+    generate_scrum_master_report,
     run_team_status_workflow,
 )
 
@@ -14,9 +16,6 @@ from src.graph.workflows.team_status import (
 class FakeMCPClient:
     def __init__(self) -> None:
         self.last_tool_args = None
-        self.last_prompt_args = None
-        self.fail_prompt = False
-        self.prompt_text = "Formatted team status report"
         self.issues_json: str = json.dumps(
             [
                 {"key": "PROJ-1", "summary": "Fix login bug", "status": "In Progress", "assignee": "Alice"},
@@ -33,24 +32,18 @@ class FakeMCPClient:
             "text": self.issues_json,
         }
 
-    async def run_prompt(self, prompt_name, arguments):
-        self.last_prompt_args = arguments
-        if self.fail_prompt:
-            raise MCPClientError("prompt failed")
-        return {
-            "name": prompt_name,
-            "arguments": arguments,
-            "text": self.prompt_text,
-        }
-
 
 class FakeOllamaService:
     def infer_board_name(self, user_input: str):
         return "Platform Team"
 
     def generate(self, prompt: str) -> str:
-        return f"LLM: {prompt}"
+        return f"LLM: {prompt[:40]}"
 
+    def build_scrum_master_report_prompt(self, payload: dict) -> str:
+        return f"Scrum report prompt for {payload.get('board_name', '')}"
+
+    # Kept for backward-compatibility with any remaining callers.
     def build_team_status_prompt(self, payload: dict) -> str:
         return f"Direct prompt for {payload.get('board_name', '')}"
 
@@ -119,87 +112,153 @@ class GroupIssuesByAssigneeTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Unit tests for format_assignee_presentation
+# ---------------------------------------------------------------------------
+
+
+class FormatAssigneePresentationTests(unittest.TestCase):
+    def _issues(self):
+        return [
+            {"key": "PROJ-1", "summary": "Fix login bug", "status": "In Progress"},
+            {"key": "PROJ-3", "summary": "Deploy service", "status": "Blocked"},
+        ]
+
+    def test_contains_assignee_name(self) -> None:
+        text = format_assignee_presentation("Alice", self._issues(), 0, 3)
+        self.assertIn("Alice", text)
+
+    def test_shows_position_in_sequence(self) -> None:
+        text = format_assignee_presentation("Alice", self._issues(), 0, 3)
+        self.assertIn("1 of 3", text)
+
+    def test_lists_each_issue(self) -> None:
+        text = format_assignee_presentation("Alice", self._issues(), 0, 3)
+        self.assertIn("PROJ-1", text)
+        self.assertIn("PROJ-3", text)
+        self.assertIn("In Progress", text)
+        self.assertIn("Blocked", text)
+
+    def test_ends_with_update_prompt(self) -> None:
+        text = format_assignee_presentation("Alice", self._issues(), 0, 3)
+        self.assertIn("please provide your status update", text)
+
+
+# ---------------------------------------------------------------------------
+# Unit tests for generate_scrum_master_report
+# ---------------------------------------------------------------------------
+
+
+class GenerateScrumMasterReportTests(unittest.TestCase):
+    def test_calls_llm_with_all_assignees(self) -> None:
+        llm = FakeOllamaService()
+        issues_by = {
+            "Alice": [{"key": "PROJ-1", "summary": "Fix login", "status": "Done"}],
+            "Bob": [{"key": "PROJ-2", "summary": "Add tests", "status": "Open"}],
+        }
+        updates = {"Alice": "Finished the fix.", "Bob": "Tests in progress."}
+        report = generate_scrum_master_report("Platform Team", ["Alice", "Bob"], issues_by, updates, llm)
+        self.assertIsInstance(report, str)
+        self.assertTrue(len(report) > 0)
+
+    def test_uses_no_update_placeholder_for_missing_assignee(self) -> None:
+        prompts_seen = []
+
+        class CaptureLLM(FakeOllamaService):
+            def build_scrum_master_report_prompt(self, payload):
+                prompts_seen.append(payload)
+                return "prompt"
+
+        generate_scrum_master_report(
+            "Board",
+            ["Alice"],
+            {"Alice": []},
+            {},  # no update for Alice
+            CaptureLLM(),
+        )
+        member = prompts_seen[0]["team_members"][0]
+        self.assertEqual(member["status_update"], "(no update provided)")
+
+
+# ---------------------------------------------------------------------------
 # Workflow integration tests
 # ---------------------------------------------------------------------------
 
 
 class TeamStatusWorkflowTests(unittest.TestCase):
-    def test_workflow_calls_correct_tool_and_groups_by_assignee(self) -> None:
+    def test_workflow_calls_correct_tool(self) -> None:
         client = FakeMCPClient()
-        llm = FakeOllamaService()
-
         result = run_team_status_workflow(
             {"user_input": "Show team status for board Platform Team"},
             client,
-            llm,
+            FakeOllamaService(),
         )
-
         self.assertEqual(client.last_tool_args, {"scrum_board_name": "Platform Team"})
-        self.assertIn("team_status_json", client.last_prompt_args)
 
-        payload = json.loads(client.last_prompt_args["team_status_json"])
-        self.assertEqual(payload["board_name"], "Platform Team")
-
-        members = {m["assignee"]: m["issues"] for m in payload["team_members"]}
-        self.assertIn("Alice", members)
-        self.assertIn("Bob", members)
-        self.assertEqual(len(members["Alice"]), 2)
-        self.assertEqual(len(members["Bob"]), 1)
-
-    def test_workflow_returns_final_response_from_prompt_output(self) -> None:
-        client = FakeMCPClient()
-        llm = FakeOllamaService()
-
+    def test_workflow_initiates_collecting_phase(self) -> None:
         result = run_team_status_workflow(
             {"user_input": "Show team status for board Platform Team"},
-            client,
-            llm,
+            FakeMCPClient(),
+            FakeOllamaService(),
         )
+        self.assertEqual(result.get("team_status_phase"), "collecting")
 
-        self.assertEqual(result.get("final_response"), "LLM: Formatted team status report")
-        self.assertIsNone(result.get("error"))
-
-    def test_workflow_falls_back_to_direct_llm_when_prompt_fails(self) -> None:
-        client = FakeMCPClient()
-        client.fail_prompt = True
-        llm = FakeOllamaService()
-
+    def test_workflow_returns_sorted_assignees(self) -> None:
         result = run_team_status_workflow(
             {"user_input": "Show team status for board Platform Team"},
-            client,
-            llm,
+            FakeMCPClient(),
+            FakeOllamaService(),
         )
+        self.assertEqual(result.get("assignees"), ["Alice", "Bob"])
 
-        self.assertIsNone(result.get("error"))
-        self.assertIn("Direct prompt for Platform Team", result.get("final_response", ""))
-
-    def test_workflow_returns_streaming_mode_without_final_response(self) -> None:
-        client = FakeMCPClient()
-        llm = FakeOllamaService()
-
+    def test_workflow_groups_issues_by_assignee(self) -> None:
         result = run_team_status_workflow(
             {"user_input": "Show team status for board Platform Team"},
-            client,
-            llm,
-            stream=True,
+            FakeMCPClient(),
+            FakeOllamaService(),
         )
+        issues_by = result.get("assignee_issues", {})
+        self.assertIn("Alice", issues_by)
+        self.assertIn("Bob", issues_by)
+        self.assertEqual(len(issues_by["Alice"]), 2)
+        self.assertEqual(len(issues_by["Bob"]), 1)
 
-        self.assertIsNone(result.get("error"))
-        self.assertEqual(result.get("final_response"), "")
-        self.assertEqual(result.get("prompt_output"), "Formatted team status report")
-
-    def test_workflow_includes_team_member_count_in_metadata(self) -> None:
-        client = FakeMCPClient()
-        llm = FakeOllamaService()
-
+    def test_workflow_starts_at_index_zero_with_empty_updates(self) -> None:
         result = run_team_status_workflow(
             {"user_input": "Show team status for board Platform Team"},
-            client,
-            llm,
+            FakeMCPClient(),
+            FakeOllamaService(),
         )
+        self.assertEqual(result.get("current_assignee_index"), 0)
+        self.assertEqual(result.get("collected_updates"), {})
 
+    def test_workflow_final_response_contains_first_assignee_presentation(self) -> None:
+        result = run_team_status_workflow(
+            {"user_input": "Show team status for board Platform Team"},
+            FakeMCPClient(),
+            FakeOllamaService(),
+        )
+        response = result.get("final_response", "")
+        # First assignee alphabetically is Alice.
+        self.assertIn("Alice", response)
+        self.assertIn("PROJ-1", response)
+
+    def test_workflow_final_response_includes_intro_header(self) -> None:
+        result = run_team_status_workflow(
+            {"user_input": "Show team status for board Platform Team"},
+            FakeMCPClient(),
+            FakeOllamaService(),
+        )
+        self.assertIn("Team Status Collection", result.get("final_response", ""))
+
+    def test_workflow_metadata_contains_phase_collecting(self) -> None:
+        result = run_team_status_workflow(
+            {"user_input": "Show team status for board Platform Team"},
+            FakeMCPClient(),
+            FakeOllamaService(),
+        )
         metadata = result.get("metadata", {})
         self.assertEqual(metadata.get("workflow"), "team_status")
+        self.assertEqual(metadata.get("phase"), "collecting")
         self.assertEqual(metadata.get("team_member_count"), 2)
 
     def test_workflow_requires_clarification_when_board_name_missing(self) -> None:
@@ -212,7 +271,6 @@ class TeamStatusWorkflowTests(unittest.TestCase):
             FakeMCPClient(),
             NoInferLLM(),
         )
-
         self.assertTrue(result.get("requires_clarification"))
         self.assertIsNotNone(result.get("error"))
 
@@ -226,18 +284,14 @@ class TeamStatusWorkflowTests(unittest.TestCase):
                 ]
             }
         )
-        llm = FakeOllamaService()
-
         result = run_team_status_workflow(
             {"user_input": "Show team status for board Platform Team"},
             client,
-            llm,
+            FakeOllamaService(),
         )
-
-        payload = json.loads(client.last_prompt_args["team_status_json"])
-        members = {m["assignee"]: m["issues"] for m in payload["team_members"]}
-        self.assertIn("Eve", members)
-        self.assertEqual(len(members["Eve"]), 2)
+        issues_by = result.get("assignee_issues", {})
+        self.assertIn("Eve", issues_by)
+        self.assertEqual(len(issues_by["Eve"]), 2)
 
     def test_workflow_handles_unassigned_issues(self) -> None:
         client = FakeMCPClient()
@@ -247,18 +301,39 @@ class TeamStatusWorkflowTests(unittest.TestCase):
                 {"key": "P-2", "assignee": "Frank", "status": "In Progress"},
             ]
         )
-        llm = FakeOllamaService()
-
         result = run_team_status_workflow(
             {"user_input": "Show team status for board Platform Team"},
             client,
-            llm,
+            FakeOllamaService(),
         )
+        issues_by = result.get("assignee_issues", {})
+        self.assertIn("Unassigned", issues_by)
+        self.assertIn("Frank", issues_by)
 
-        payload = json.loads(client.last_prompt_args["team_status_json"])
-        assignees = [m["assignee"] for m in payload["team_members"]]
-        self.assertIn("Unassigned", assignees)
-        self.assertIn("Frank", assignees)
+    def test_workflow_no_issues_returns_complete_phase(self) -> None:
+        client = FakeMCPClient()
+        client.issues_json = json.dumps([])
+        result = run_team_status_workflow(
+            {"user_input": "Show team status for board Platform Team"},
+            client,
+            FakeOllamaService(),
+        )
+        metadata = result.get("metadata", {})
+        self.assertEqual(metadata.get("phase"), "complete")
+        self.assertIsNone(result.get("error"))
+
+    def test_workflow_tool_error_returns_error_key(self) -> None:
+        class FailingClient(FakeMCPClient):
+            async def call_tool(self, tool_name, arguments):
+                raise MCPClientError("connection refused")
+
+        result = run_team_status_workflow(
+            {"user_input": "Show team status for board Platform Team"},
+            FailingClient(),
+            FakeOllamaService(),
+        )
+        self.assertIsNotNone(result.get("error"))
+        self.assertIsNone(result.get("team_status_phase"))
 
 
 if __name__ == "__main__":

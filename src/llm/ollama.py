@@ -233,6 +233,51 @@ class OllamaService:
             f"Team status data:\n{json.dumps({'board_name': board_name, 'team_members': members}, indent=2)}"
         )
 
+    def build_scrum_master_report_prompt(self, payload: dict) -> str:
+        """Build a prompt that synthesizes per-assignee status updates into a scrum master report.
+
+        Each entry in ``payload["team_members"]`` carries the assignee name,
+        their Jira issues, and the status update they provided during the
+        interactive collection cycle.
+
+        Args:
+            payload: Dict with keys ``"board_name"`` and ``"team_members"``.
+                Each team member entry has ``"assignee"``, ``"issues"``, and
+                ``"status_update"`` keys.
+
+        Returns:
+            A fully-formed LLM prompt string.
+        """
+        board_name = payload.get("board_name", "the board")
+        members = payload.get("team_members", [])
+        member_blocks = []
+        for member in members:
+            assignee = member.get("assignee", "Unknown")
+            issues = member.get("issues", [])
+            update = member.get("status_update", "(no update provided)")
+            issue_lines = "\n".join(
+                f"  - {i.get('key', '?')}: {i.get('summary', '')} [{i.get('status', '')}]"
+                for i in issues
+            )
+            member_blocks.append(
+                f"### {assignee}\n"
+                f"Issues:\n{issue_lines or '  (none)'}\n"
+                f"Status Update: {update}"
+            )
+        members_text = "\n\n".join(member_blocks)
+        return (
+            f"You are preparing a detailed standup/status report for the scrum master "
+            f"of the **{board_name}** board.\n\n"
+            "Below are the team members, their current Jira issues, and the status updates "
+            "they provided during this collection cycle.\n\n"
+            f"{members_text}\n\n"
+            "---\n\n"
+            "Please produce a structured scrum master report with:\n"
+            "1. A **per-member summary** — highlight progress, blockers, and risks for each assignee.\n"
+            "2. An **overall team status** section — cross-cutting risks, sprint health, and "
+            "recommended next steps for the scrum master."
+        )
+
     def _safe_json_extract(self, raw: object) -> dict:
         """Parse a JSON dict from a raw LLM response, tolerating extra text.
 

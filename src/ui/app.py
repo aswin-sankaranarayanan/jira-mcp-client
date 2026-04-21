@@ -56,6 +56,10 @@ def _init_state() -> None:
         st.session_state.engine = JiraWorkflowEngine(client, llm)
         logger.info("Created workflow engine for session")
 
+    # Holds the active team-status collection session; None when not collecting.
+    if "team_status_session" not in st.session_state:
+        st.session_state.team_status_session = None
+
 
 def _render_messages(messages: List[Dict[str, str]]) -> None:
     """Render a list of chat messages into the active Streamlit chat container.
@@ -133,7 +137,18 @@ def run_app() -> None:
                     response_placeholder = st.empty()
                     progress_placeholder.info("Thinking...")
 
-                    for event in st.session_state.engine.stream_events(prompt):
+                    # Route to the team-status collection handler when a
+                    # collection cycle is already in progress; otherwise use
+                    # the normal workflow engine.
+                    engine = st.session_state.engine
+                    if st.session_state.team_status_session is not None:
+                        event_source = engine.advance_team_status_collection(
+                            st.session_state.team_status_session, prompt
+                        )
+                    else:
+                        event_source = engine.stream_events(prompt)
+
+                    for event in event_source:
                         event_type = str(event.get("type") or "")
                         message = str(event.get("message") or "")
                         if event_type == "progress":
@@ -148,6 +163,16 @@ def run_app() -> None:
                             progress_placeholder.empty()
                             assistant_text = message
                             response_placeholder.markdown(assistant_text)
+                            continue
+                        if event_type == "session":
+                            # Update the team-status collection session in
+                            # Streamlit state without affecting the UI display.
+                            data = event.get("data") or {}
+                            action = str(data.get("action") or "")
+                            if action in {"team_status_start", "team_status_advance"}:
+                                st.session_state.team_status_session = data.get("session")
+                            elif action == "team_status_complete":
+                                st.session_state.team_status_session = None
                             continue
                         if event_type == "error":
                             progress_placeholder.empty()

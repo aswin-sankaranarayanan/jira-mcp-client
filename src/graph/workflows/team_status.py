@@ -21,9 +21,6 @@ TEAM_STATUS_TOOL_ERROR = (
     "I couldn't fetch team member status updates right now. "
     "Please check the MCP server connection and try again."
 )
-TEAM_STATUS_LLM_ERROR = (
-    "I collected the team status data, but I couldn't format the report right now. Please try again."
-)
 
 
 def _extract_assignee_name(issue: Dict[str, Any]) -> str:
@@ -67,12 +64,127 @@ def _group_issues_by_assignee(issues: List[Any]) -> Dict[str, List[Any]]:
     return grouped
 
 
+def format_assignee_presentation(
+    assignee: str,
+    issues: List[Any],
+    index: int,
+    total: int,
+) -> str:
+    """Format one assignee's issues as a structured collection prompt.
+
+    Returns a Markdown block showing the assignee's current sprint issues
+    and asking them to provide a status update.
+
+    Args:
+        assignee: Assignee display name.
+        issues: List of Jira issue dicts for this assignee.
+        index: Zero-based position of this assignee in the full list.
+        total: Total number of assignees being collected.
+
+    Returns:
+        Markdown-formatted string ready for display in the chat UI.
+    """
+    lines = [
+        f"**{assignee}** ({index + 1} of {total})",
+        "",
+        f"Here are **{assignee}'s** current issues:",
+        "",
+    ]
+    for issue in issues:
+        key = issue.get("id", "?")
+        summary = issue.get("summary", "(no summary)")
+        status = issue.get("status", "Unknown")
+        lines.append(f"- **{key}**: {summary}  `{status}`")
+    lines.extend([
+        "",
+        f"{assignee}, please provide your status update:",
+    ])
+    return "\n".join(lines)
+
+
+def generate_scrum_master_report(
+    board_name: str,
+    assignees: List[str],
+    issues_by_assignee: Dict[str, List[Any]],
+    collected_updates: Dict[str, str],
+    llm_service: OllamaService,
+) -> str:
+    """Synthesize all collected status updates into a scrum master report.
+
+    Builds a structured prompt that combines each assignee's issue list with
+    their self-reported update, then delegates to the LLM for the final
+    analytical narrative.
+
+    Args:
+        board_name: Name of the Scrum board.
+        assignees: Ordered list of assignee names.
+        issues_by_assignee: Sprint issues grouped by assignee name.
+        collected_updates: Self-reported status text keyed by assignee name.
+        llm_service: Configured LLM service.
+
+    Returns:
+        Markdown-formatted scrum master report.
+    """
+    started_at = perf_counter()
+    payload = {
+        "board_name": board_name,
+        "team_members": [
+            {
+                "assignee": assignee,
+                "issues": issues_by_assignee.get(assignee, []),
+                "status_update": collected_updates.get(assignee, "(no update provided)"),
+            }
+            for assignee in assignees
+        ],
+    }
+    prompt = llm_service.build_scrum_master_report_prompt(payload)
+    report = llm_service.generate(prompt)
+    logger.info(
+        "Generated scrum master report",
+        extra={
+            "duration_ms": round((perf_counter() - started_at) * 1000, 2),
+            "assignee_count": len(assignees),
+            "response_length": len(report),
+        },
+    )
+    return report
+
+
 def run_team_status_workflow(
     state: JiraGraphState,
     mcp_client: MCPClient,
     llm_service: OllamaService,
     stream: bool = False,
 ) -> Dict[str, object]:
+    """Phase 1 of the team status collection cycle.
+
+    Fetches all active sprint issues for the board, groups them by assignee,
+    and returns the first assignee's issues as a structured presentation.
+    The returned state carries ``team_status_phase="collecting"`` together
+    with the full ``assignees`` list, ``assignee_issues`` map, and an empty
+    ``collected_updates`` dict so the UI can resume the loop across
+    subsequent user turns.
+
+    Args:
+        state: Current workflow state; must contain ``"board_name"`` or a
+            parseable ``"user_input"``.
+        mcp_client: Configured MCP client used to fetch sprint issues.
+        llm_service: Configured LLM service used to infer the board name
+            when it cannot be extracted via regex.
+        stream: Unused in this phase; preserved for interface compatibility.
+
+    Returns:
+        Partial state dict containing:
+
+        * ``"final_response"`` — intro header plus first assignee's issue
+          presentation.
+        * ``"team_status_phase"`` — ``"collecting"``.
+        * ``"assignees"`` — sorted list of all assignee names.
+        * ``"assignee_issues"`` — issues grouped by assignee.
+        * ``"current_assignee_index"`` — ``0``.
+        * ``"collected_updates"`` — empty dict.
+        * ``"metadata"`` — observability metadata.
+    """
     board_name = state.get("board_name") or extract_board_name(state.get("user_input", ""))
     with logging_context(workflow="team_status", board_name=board_name or None):
         if not board_name:
@@ -137,71 +249,54 @@ def run_team_status_workflow(
                 extra={"team_member_count": len(by_assignee)},
             )
 
-            team_status_payload: Dict[str, Any] = {
-                "board_name": board_name,
-                "team_members": [
-                    {"assignee": assignee, "issues": member_issues}
-                    for assignee, member_issues in sorted(by_assignee.items())
-                ],
-            }
-
-            prompt_args = {
-                "team_status_json": json.dumps(team_status_payload),
-            }
-
-            prompt_started_at = perf_counter()
-            prompt_text = ""
-            try:
-                logger.info("Fetching team status prompt template")
-                prompt_output = asyncio.run(
-                    mcp_client.run_prompt("format_team_status_report", prompt_args)
-                )
-                prompt_text = prompt_output.get("text", "").strip()
-                if not prompt_text:
-                    logger.warning(
-                        "Team status prompt template returned empty text; "
-                        "falling back to direct LLM prompt"
-                    )
-                    prompt_text = llm_service.build_team_status_prompt(team_status_payload)
-            except MCPClientError:
-                logger.warning(
-                    "Team status prompt failed; falling back to direct LLM summarization"
-                )
-                prompt_text = llm_service.build_team_status_prompt(team_status_payload)
-
-            formatted = "" if stream else (llm_service.generate(prompt_text) if prompt_text else "")
-            if not formatted and not stream:
-                logger.warning("Team status LLM response was empty")
+            if not by_assignee:
                 return {
                     "board_name": board_name,
                     "tool_output": tool_output,
-                    "error": TEAM_STATUS_LLM_ERROR,
+                    "final_response": (
+                        f"No active sprint issues found for board **{board_name}**."
+                    ),
                     "metadata": {
                         "workflow": "team_status",
+                        "phase": "complete",
                         "tool": "get_active_sprint_issues",
-                        "prompt": "format_team_status_report",
-                        "team_member_count": len(by_assignee),
+                        "team_member_count": 0,
                     },
                 }
 
+            assignees = sorted(by_assignee.keys())
+            intro = (
+                f"## Team Status Collection — {board_name}\n\n"
+                f"Found **{len(assignees)} team member(s)** with active issues. "
+                "Please provide status updates for each assignee.\n\n"
+                "---\n\n"
+            )
+            first_presentation = format_assignee_presentation(
+                assignees[0], by_assignee[assignees[0]], 0, len(assignees)
+            )
+
             logger.info(
-                "Generated team status report",
+                "Initiated team status collection",
                 extra={
-                    "duration_ms": round((perf_counter() - prompt_started_at) * 1000, 2),
-                    "response_length": len(formatted),
-                    "team_member_count": len(by_assignee),
+                    "team_member_count": len(assignees),
+                    "first_assignee": assignees[0],
                 },
             )
 
             return {
                 "board_name": board_name,
                 "tool_output": tool_output,
-                "prompt_output": prompt_text,
-                "final_response": formatted,
+                "final_response": intro + first_presentation,
+                "team_status_phase": "collecting",
+                "assignees": assignees,
+                "assignee_issues": by_assignee,
+                "current_assignee_index": 0,
+                "collected_updates": {},
                 "metadata": {
                     "workflow": "team_status",
+                    "phase": "collecting",
                     "tool": "get_active_sprint_issues",
-                    "prompt": "format_team_status_report",
-                    "team_member_count": len(by_assignee),
+                    "team_member_count": len(assignees),
+                    "current_assignee": assignees[0],
                 },
             }
